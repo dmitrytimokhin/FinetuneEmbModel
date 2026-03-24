@@ -1,0 +1,35 @@
+services:
+  finetuning:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: finetuning-cuda:latest
+    container_name: finetuning-dev
+    # ── GPU доступ ────────────────────────────────────────────────────────────
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - HF_HOME=/workspace/.cache/huggingface
+      - TRANSFORMERS_CACHE=/workspace/.cache/huggingface
+    ports:
+      - "8888:8888"       # JupyterLab
+    volumes:
+      # Весь проект монтируется как /workspace
+      - .:/workspace
+      # Отдельный volume для кэша моделей HuggingFace (не пересоздаётся при rebuild)
+      - hf_cache:/workspace/.cache/huggingface
+    working_dir: /workspace
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+
+volumes:
+  hf_cache:
+    driver: local
