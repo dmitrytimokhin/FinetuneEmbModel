@@ -26,6 +26,7 @@ trainer.py
 from __future__ import annotations
 
 import logging
+import math
 import os
 from dataclasses import dataclass, field
 from enum import Enum
@@ -106,6 +107,9 @@ class TrainingConfig:
     # ── Misc ─────────────────────────────────────────────────────────────────
     seed: int = 42
     dataloader_num_workers: int = 0
+
+    # Логирование: каждые N эпох (если задано — переопределяет logging_steps)
+    log_every_n_epochs: Optional[int] = None
 
     # TSDAE-специфично
     tsdae_noise_ratio: float = 0.6
@@ -271,10 +275,11 @@ class EmbeddingTrainer:
             )
 
         elif loss_type == LossType.MNRL:
+            from sentence_transformers import util as st_util
             return MultipleNegativesRankingLoss(
                 model=self.model,
                 scale=1.0 / self.config.temperature,
-                similarity_fct=None,  # default: cosine
+                similarity_fct=st_util.cos_sim,
             )
 
         elif loss_type == LossType.CACHED_MNRL:
@@ -342,6 +347,21 @@ class EmbeddingTrainer:
         else:
             batch_sampler = BatchSamplers.BATCH_SAMPLER
 
+        # Вычисляем logging_steps: если задан log_every_n_epochs — пересчитываем из эпох
+        if self.config.log_every_n_epochs is not None:
+            steps_per_epoch = max(
+                1, math.ceil(len(train_dataset) / self.config.batch_size)
+            )
+            effective_logging_steps = steps_per_epoch * self.config.log_every_n_epochs
+            logger.info(
+                "logging_steps=%d (log_every_n_epochs=%d × steps_per_epoch=%d)",
+                effective_logging_steps,
+                self.config.log_every_n_epochs,
+                steps_per_epoch,
+            )
+        else:
+            effective_logging_steps = self.config.logging_steps
+
         training_args = SentenceTransformerTrainingArguments(
             output_dir=self.config.output_dir,
             num_train_epochs=self.config.num_epochs,
@@ -357,7 +377,7 @@ class EmbeddingTrainer:
             eval_steps=self.config.eval_steps if eval_dataset else None,
             save_strategy="steps",
             save_steps=self.config.save_steps,
-            logging_steps=self.config.logging_steps,
+            logging_steps=effective_logging_steps,
             load_best_model_at_end=self.config.load_best_model_at_end and eval_dataset is not None,
             metric_for_best_model=self.config.metric_for_best_model,
             seed=self.config.seed,
