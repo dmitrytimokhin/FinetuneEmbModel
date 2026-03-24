@@ -173,9 +173,80 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 
-# Cursor  
-#  Cursor is an AI-powered code editor.`.cursorignore` specifies files/directories to 
-#  exclude from AI features like autocomplete and code analysis. Recommended for sensitive data
-#  refer to https://docs.cursor.com/context/ignore-files
+# Cursor
 .cursorignore
 .cursorindexingignore
+
+# ── ML / Model training ───────────────────────────────────────────────────────
+# Обученные модели и чекпоинты (большие бинарные файлы)
+output/
+output_cpu/
+output_gpu/
+checkpoints/
+runs/
+checkpoint-*/
+**/checkpoint-*/
+
+# Веса моделей
+*.bin
+*.pt
+*.pth
+*.safetensors
+*.ckpt
+*.onnx
+*.tflite
+
+# HuggingFace кэш
+.cache/
+~/.cache/huggingface/
+**/hub/
+
+# Sentence-transformers кэш
+sentence_transformers_cache/
+
+# ── Данные ────────────────────────────────────────────────────────────────────
+# Большие датасеты (оставляем только data_test как тестовые примеры)
+data/
+*.parquet
+*.arrow
+*.feather
+*.hdf5
+*.h5
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/
+# Очищенные outputs ноутбуков коммитим, с outputs — нет
+# *.ipynb  # раскомментировать если не хотите коммитить ноутбуки вовсе
+
+# ── Логи и эксперименты ───────────────────────────────────────────────────────
+*.log
+logs/
+wandb/
+mlruns/
+tensorboard/
+events.out.tfevents.*
+
+# ── macOS ─────────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ── Секреты ───────────────────────────────────────────────────────────────────
+.env
+.env.*
+secrets.yaml
+secrets.json
+
+# ── Claude Code ───────────────────────────────────────────────────────────────
+# settings.local.json — локальные разрешения инструментов, специфичны для машины
+.claude/settings.local.json
