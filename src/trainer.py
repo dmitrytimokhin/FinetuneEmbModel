@@ -282,13 +282,17 @@ class EmbeddingTrainer:
             )
 
         elif loss_type == LossType.TSDAE:
-            # TSDAE через seq2seq tie_encoder_decoder
+            # TSDAE: denoising autoencoder для encoder-only моделей.
+            # tie_encoder_decoder=True — единственный корректный режим для
+            # моделей типа BGE/mBERT (encoder-only): энкодер используется
+            # и как encoder, и как decoder с привязанными весами (TSDAE paper,
+            # Wang et al. 2021). При tie_encoder_decoder=False требуется
+            # отдельная seq2seq-архитектура, которой у USER-bge-m3 нет.
             try:
                 from sentence_transformers.losses import DenoisingAutoEncoderLoss
                 return DenoisingAutoEncoderLoss(
                     model=self.model,
-                    decoder_name_or_path=self.config.model_name,
-                    tie_encoder_decoder=False,
+                    tie_encoder_decoder=True,
                 )
             except ImportError:
                 logger.warning(
