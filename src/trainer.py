@@ -287,7 +287,7 @@ class EmbeddingTrainer:
                 from sentence_transformers.losses import DenoisingAutoEncoderLoss
                 return DenoisingAutoEncoderLoss(
                     model=self.model,
-                    tie_encoder_decoder=True,
+                    tie_encoder_decoder=False,
                 )
             except ImportError:
                 logger.warning(
