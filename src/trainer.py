@@ -48,6 +48,7 @@ from sentence_transformers.training_args import (
     BatchSamplers,
     SentenceTransformerTrainingArguments,
 )
+from transformers import TrainerCallback
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +136,49 @@ class TrainingConfig:
                 else:
                     self.fp16 = True
                     logger.info("GPU: включён fp16")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Logging callback
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _EpochLogCallback(TrainerCallback):
+    """
+    Выводит train_loss, eval_loss и lr через наш logger в конце каждой эпохи.
+    Работает независимо от logging_steps — всегда показывает метрики по эпохам.
+    """
+
+    def on_epoch_end(self, args, state, control, **kwargs):
+        if not state.log_history:
+            return
+
+        # Ищем последние значения train loss и lr из истории
+        loss, lr = None, None
+        for entry in reversed(state.log_history):
+            if loss is None and "loss" in entry:
+                loss = entry["loss"]
+            if lr is None and "learning_rate" in entry:
+                lr = entry["learning_rate"]
+            if loss is not None and lr is not None:
+                break
+
+        epoch = round(state.epoch) if state.epoch else "?"
+        parts = [f"Epoch {epoch}/{int(args.num_train_epochs)}"]
+        if loss is not None:
+            parts.append(f"train_loss={loss:.4f}")
+        if lr is not None:
+            parts.append(f"lr={lr:.2e}")
+        logger.info(" | ".join(parts))
+
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        if not metrics:
+            return
+        epoch = round(state.epoch) if state.epoch else "?"
+        parts = [f"Epoch {epoch}/{int(args.num_train_epochs)} [eval]"]
+        for k, v in metrics.items():
+            if isinstance(v, float):
+                parts.append(f"{k}={v:.4f}")
+        logger.info(" | ".join(parts))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -392,6 +436,7 @@ class EmbeddingTrainer:
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
             loss=loss,
+            callbacks=[_EpochLogCallback()],
         )
 
         logger.info(
