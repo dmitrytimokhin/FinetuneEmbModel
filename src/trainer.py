@@ -101,16 +101,21 @@ class TrainingConfig:
     output_dir: str = "./output"
     eval_steps: int = 100
     save_steps: int = 200
-    logging_steps: int = 10
+    logging_steps: int = 10           # используется только при logging_strategy="steps"
     load_best_model_at_end: bool = True
     metric_for_best_model: str = "eval_loss"
+
+    # ── Ранняя остановка ─────────────────────────────────────────────────────
+    # 0 = выключено; supervised — по eval_loss, unsupervised — по train_loss
+    early_stopping_patience: int = 3
+
+    # ── Логирование ──────────────────────────────────────────────────────────
+    # "epoch" — каждую эпоху (рекомендуется); "steps" — каждые logging_steps шагов
+    logging_strategy: str = "epoch"
 
     # ── Misc ─────────────────────────────────────────────────────────────────
     seed: int = 42
     dataloader_num_workers: int = 0
-
-    # Логирование: каждые N эпох (если задано — переопределяет logging_steps)
-    log_every_n_epochs: Optional[int] = None
 
     # TSDAE-специфично
     tsdae_noise_ratio: float = 0.6
@@ -144,41 +149,73 @@ class TrainingConfig:
 
 class _EpochLogCallback(TrainerCallback):
     """
-    Выводит train_loss, eval_loss и lr через наш logger в конце каждой эпохи.
-    Работает независимо от logging_steps — всегда показывает метрики по эпохам.
+    Структурированное логирование через Python logger.
+    Срабатывает при каждом log-событии трейнера (on_log):
+      - train: выводит loss, lr
+      - eval:  выводит все eval_* метрики
+    С logging_strategy="epoch" вызывается ровно раз в эпоху.
     """
 
-    def on_epoch_end(self, args, state, control, **kwargs):
-        if not state.log_history:
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not logs:
             return
+        epoch = state.epoch or 0
+        total = int(args.num_train_epochs)
 
-        # Ищем последние значения train loss и lr из истории
-        loss, lr = None, None
-        for entry in reversed(state.log_history):
-            if loss is None and "loss" in entry:
-                loss = entry["loss"]
-            if lr is None and "learning_rate" in entry:
-                lr = entry["learning_rate"]
-            if loss is not None and lr is not None:
-                break
+        if "loss" in logs:
+            parts = [f"Epoch {epoch:.0f}/{total} [train]",
+                     f"loss={logs['loss']:.4f}"]
+            if "learning_rate" in logs:
+                parts.append(f"lr={logs['learning_rate']:.2e}")
+            logger.info(" | ".join(parts))
 
-        epoch = round(state.epoch) if state.epoch else "?"
-        parts = [f"Epoch {epoch}/{int(args.num_train_epochs)}"]
-        if loss is not None:
-            parts.append(f"train_loss={loss:.4f}")
-        if lr is not None:
-            parts.append(f"lr={lr:.2e}")
-        logger.info(" | ".join(parts))
+        elif any(k.startswith("eval_") for k in logs):
+            parts = [f"Epoch {epoch:.0f}/{total} [eval]"]
+            for k, v in logs.items():
+                if isinstance(v, float):
+                    parts.append(f"{k}={v:.4f}")
+            logger.info(" | ".join(parts))
 
-    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
-        if not metrics:
+
+class _EarlyStoppingOnTrainLoss(TrainerCallback):
+    """
+    Ранняя остановка по train_loss — для unsupervised этапа (без eval_dataset).
+    При каждом улучшении сохраняет лучшую модель в `best_model_dir`.
+    Останавливает обучение если `patience` эпох подряд нет улучшения.
+    """
+
+    def __init__(self, patience: int, best_model_dir: str) -> None:
+        self.patience = patience
+        self.best_model_dir = best_model_dir
+        self.best_loss = float("inf")
+        self.no_improve = 0
+
+    def on_log(self, args, state, control, logs=None, model=None, **kwargs):
+        if not logs or "loss" not in logs:
             return
-        epoch = round(state.epoch) if state.epoch else "?"
-        parts = [f"Epoch {epoch}/{int(args.num_train_epochs)} [eval]"]
-        for k, v in metrics.items():
-            if isinstance(v, float):
-                parts.append(f"{k}={v:.4f}")
-        logger.info(" | ".join(parts))
+        loss = logs["loss"]
+        epoch = state.epoch or 0
+
+        if loss < self.best_loss - 1e-5:
+            self.best_loss = loss
+            self.no_improve = 0
+            if model is not None:
+                model.save(self.best_model_dir)
+            logger.info(
+                "EarlyStopping [train] epoch=%.0f: loss=%.4f ↓ (best saved → %s)",
+                epoch, loss, self.best_model_dir,
+            )
+        else:
+            self.no_improve += 1
+            logger.info(
+                "EarlyStopping [train] epoch=%.0f: loss=%.4f (best=%.4f, no improve %d/%d)",
+                epoch, loss, self.best_loss, self.no_improve, self.patience,
+            )
+            if self.no_improve >= self.patience:
+                logger.info(
+                    "Ранняя остановка: %d эпох без улучшения train_loss.", self.patience
+                )
+                control.should_training_stop = True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -391,20 +428,43 @@ class EmbeddingTrainer:
         else:
             batch_sampler = BatchSamplers.BATCH_SAMPLER
 
-        # Вычисляем logging_steps: если задан log_every_n_epochs — пересчитываем из эпох
-        if self.config.log_every_n_epochs is not None:
-            steps_per_epoch = max(
-                1, math.ceil(len(train_dataset) / self.config.batch_size)
-            )
-            effective_logging_steps = steps_per_epoch * self.config.log_every_n_epochs
-            logger.info(
-                "logging_steps=%d (log_every_n_epochs=%d × steps_per_epoch=%d)",
-                effective_logging_steps,
-                self.config.log_every_n_epochs,
-                steps_per_epoch,
-            )
-        else:
-            effective_logging_steps = self.config.logging_steps
+        has_eval = eval_dataset is not None
+
+        # ── Callbacks ────────────────────────────────────────────────────────
+        callbacks = [_EpochLogCallback()]
+        early_stop_best_dir: Optional[str] = None
+
+        if self.config.early_stopping_patience > 0:
+            if has_eval:
+                # Supervised: встроенный EarlyStoppingCallback по eval_loss
+                from transformers import EarlyStoppingCallback as _ESC
+                callbacks.append(_ESC(
+                    early_stopping_patience=self.config.early_stopping_patience,
+                ))
+                logger.info(
+                    "EarlyStopping (eval_loss): patience=%d",
+                    self.config.early_stopping_patience,
+                )
+            else:
+                # Unsupervised (TSDAE): ранняя остановка по train_loss
+                early_stop_best_dir = os.path.join(
+                    self.config.output_dir, "best_unsupervised"
+                )
+                callbacks.append(_EarlyStoppingOnTrainLoss(
+                    patience=self.config.early_stopping_patience,
+                    best_model_dir=early_stop_best_dir,
+                ))
+                logger.info(
+                    "EarlyStopping (train_loss): patience=%d, best→%s",
+                    self.config.early_stopping_patience,
+                    early_stop_best_dir,
+                )
+
+        # ── Стратегии eval / save / log ──────────────────────────────────────
+        # Оба параметра должны совпадать для load_best_model_at_end
+        eval_strategy_val = "epoch" if has_eval else "no"
+        save_strategy_val = "epoch"
+        load_best = self.config.load_best_model_at_end and has_eval
 
         training_args = SentenceTransformerTrainingArguments(
             output_dir=self.config.output_dir,
@@ -417,17 +477,16 @@ class EmbeddingTrainer:
             gradient_accumulation_steps=self.config.gradient_accumulation_steps,
             fp16=self.config.fp16,
             bf16=self.config.bf16,
-            eval_strategy="steps" if eval_dataset else "no",
-            eval_steps=self.config.eval_steps if eval_dataset else None,
-            save_strategy="steps",
-            save_steps=self.config.save_steps,
-            logging_steps=effective_logging_steps,
-            load_best_model_at_end=self.config.load_best_model_at_end and eval_dataset is not None,
+            eval_strategy=eval_strategy_val,
+            save_strategy=save_strategy_val,
+            logging_strategy=self.config.logging_strategy,
+            logging_steps=self.config.logging_steps,
+            load_best_model_at_end=load_best,
             metric_for_best_model=self.config.metric_for_best_model,
             seed=self.config.seed,
             dataloader_num_workers=self.config.dataloader_num_workers,
             batch_sampler=batch_sampler,
-            report_to="none",  # отключаем W&B/TensorBoard по умолчанию
+            report_to="none",
         )
 
         trainer = SentenceTransformerTrainer(
@@ -436,18 +495,28 @@ class EmbeddingTrainer:
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
             loss=loss,
-            callbacks=[_EpochLogCallback()],
+            callbacks=callbacks,
         )
 
         logger.info(
-            "Старт обучения: epochs=%d, batch=%d, lr=%s, device=%s",
+            "Старт обучения: epochs=%d, batch=%d, lr=%s, device=%s, "
+            "early_stop_patience=%d, logging=%s",
             self.config.num_epochs,
             self.config.batch_size,
             self.config.learning_rate,
             self.device,
+            self.config.early_stopping_patience,
+            self.config.logging_strategy,
         )
         trainer.train()
         logger.info("Обучение завершено.")
+
+        # Если unsupervised early stopping сохранил лучшую модель — загружаем её
+        if early_stop_best_dir and Path(early_stop_best_dir).exists():
+            self.load_model(early_stop_best_dir)
+            logger.info(
+                "Загружена лучшая модель (train_loss) из: %s", early_stop_best_dir
+            )
 
     # ── Save / Load ──────────────────────────────────────────────────────────
 
