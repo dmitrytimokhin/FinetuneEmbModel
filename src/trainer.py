@@ -219,13 +219,15 @@ class EmbeddingTrainer:
         loss_type = self.config.loss_type
 
         if loss_type == LossType.TSDAE:
-            # TSDAE: нужны пары (corrupted, original)
+            # TSDAE / SimCSE-стиль: пары (corrupted → anchor, original → positive).
+            # Колонки anchor/positive совместимы и с DenoisingAutoEncoderLoss
+            # (порядок: noisy→encoder, clean→decoder), и с MNRL-fallback.
             col = "sentence" if "sentence" in df.columns else "anchor"
             sentences = df[col].tolist()
             noised = [_add_noise(s, self.config.tsdae_noise_ratio) for s in sentences]
             return Dataset.from_dict({
-                "damaged_sentence": noised,
-                "sentence": sentences,
+                "anchor": noised,
+                "positive": sentences,
             })
 
         elif loss_type == LossType.TRIPLET:
@@ -282,24 +284,28 @@ class EmbeddingTrainer:
             )
 
         elif loss_type == LossType.TSDAE:
-            # TSDAE: denoising autoencoder для encoder-only моделей.
-            # tie_encoder_decoder=True — единственный корректный режим для
-            # моделей типа BGE/mBERT (encoder-only): энкодер используется
-            # и как encoder, и как decoder с привязанными весами (TSDAE paper,
-            # Wang et al. 2021). При tie_encoder_decoder=False требуется
-            # отдельная seq2seq-архитектура, которой у USER-bge-m3 нет.
+            # Пытаемся использовать DenoisingAutoEncoderLoss (sentence-transformers
+            # + transformers < 5.0.0). Если недоступен или несовместим —
+            # переходим на MNRL по парам (noised, original): это SimCSE-стиль,
+            # дающий аналогичный эффект доменной адаптации без seq2seq-архитектуры.
             try:
                 from sentence_transformers.losses import DenoisingAutoEncoderLoss
-                return DenoisingAutoEncoderLoss(
+                loss = DenoisingAutoEncoderLoss(
                     model=self.model,
                     tie_encoder_decoder=True,
                 )
-            except ImportError:
+                logger.info("TSDAE: используется DenoisingAutoEncoderLoss")
+                return loss
+            except (ImportError, RuntimeError) as exc:
                 logger.warning(
-                    "DenoisingAutoEncoderLoss недоступен в текущей версии "
-                    "sentence-transformers. Переключаемся на MNRL."
+                    "DenoisingAutoEncoderLoss недоступен (%s). "
+                    "Переключаемся на MNRL(noised, original) — SimCSE-стиль доменной адаптации.",
+                    exc,
                 )
-                return MultipleNegativesRankingLoss(model=self.model)
+                return MultipleNegativesRankingLoss(
+                    model=self.model,
+                    scale=1.0 / self.config.temperature,
+                )
 
         raise ValueError(f"Неизвестный тип loss: {loss_type}")
 
