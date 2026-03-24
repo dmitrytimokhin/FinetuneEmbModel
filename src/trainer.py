@@ -40,6 +40,7 @@ from sentence_transformers.losses import (
     CachedMultipleNegativesRankingLoss,
     MultipleNegativesRankingLoss,
     TripletLoss,
+    TripletDistanceMetric,
 )
 from sentence_transformers.trainer import SentenceTransformerTrainer
 from sentence_transformers.training_args import (
@@ -265,7 +266,7 @@ class EmbeddingTrainer:
         if loss_type == LossType.TRIPLET:
             return TripletLoss(
                 model=self.model,
-                distance_metric="cosine",  # cosine | euclidean | manhattan
+                distance_metric=TripletDistanceMetric.COSINE,
                 triplet_margin=self.config.triplet_margin,
             )
 
@@ -347,7 +348,7 @@ class EmbeddingTrainer:
             per_device_train_batch_size=self.config.batch_size,
             per_device_eval_batch_size=self.config.batch_size,
             learning_rate=self.config.learning_rate,
-            warmup_ratio=self.config.warmup_ratio,
+            warmup_steps=self.config.warmup_ratio,
             weight_decay=self.config.weight_decay,
             gradient_accumulation_steps=self.config.gradient_accumulation_steps,
             fp16=self.config.fp16,
