@@ -433,6 +433,15 @@ class EmbeddingTrainer:
 
         has_eval = eval_dataset is not None
 
+        # ── Имя директории лучшей модели (по типу loss) ──────────────────────
+        _loss_dir_name = {
+            LossType.TSDAE:        "best_unsupervised",
+            LossType.TRIPLET:      "best_triplet",
+            LossType.MNRL:         "best_mnrl",
+            LossType.CACHED_MNRL:  "best_mnrl",
+        }.get(self.config.loss_type, f"best_{self.config.loss_type.value}")
+        best_model_dir = os.path.join(self.config.output_dir, _loss_dir_name)
+
         # ── Callbacks ────────────────────────────────────────────────────────
         callbacks = [_EpochLogCallback()]
         early_stop_best_dir: Optional[str] = None
@@ -445,14 +454,13 @@ class EmbeddingTrainer:
                     early_stopping_patience=self.config.early_stopping_patience,
                 ))
                 logger.info(
-                    "EarlyStopping (eval_loss): patience=%d",
+                    "EarlyStopping (eval_loss): patience=%d, best→%s",
                     self.config.early_stopping_patience,
+                    best_model_dir,
                 )
             else:
                 # Unsupervised (TSDAE): ранняя остановка по train_loss
-                early_stop_best_dir = os.path.join(
-                    self.config.output_dir, "best_unsupervised"
-                )
+                early_stop_best_dir = best_model_dir
                 callbacks.append(_EarlyStoppingOnTrainLoss(
                     patience=self.config.early_stopping_patience,
                     best_model_dir=early_stop_best_dir,
@@ -520,12 +528,15 @@ class EmbeddingTrainer:
         trainer.train()
         logger.info("Обучение завершено.")
 
-        # Если unsupervised early stopping сохранил лучшую модель — загружаем её
         if early_stop_best_dir and Path(early_stop_best_dir).exists():
+            # Unsupervised: callback уже сохранил лучшую модель — загружаем
             self.load_model(early_stop_best_dir)
-            logger.info(
-                "Загружена лучшая модель (train_loss) из: %s", early_stop_best_dir
-            )
+            logger.info("Загружена лучшая модель (train_loss) из: %s", early_stop_best_dir)
+        elif has_eval:
+            # Supervised: load_best_model_at_end=True уже загрузил лучшие веса в trainer.model,
+            # явно сохраняем в именованную директорию
+            self.save_model(best_model_dir)
+            logger.info("Лучшая модель (eval_loss) сохранена в: %s", best_model_dir)
 
     # ── Save / Load ──────────────────────────────────────────────────────────
 
