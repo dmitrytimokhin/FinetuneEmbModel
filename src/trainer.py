@@ -104,6 +104,9 @@ class TrainingConfig:
     logging_steps: int = 10           # используется только при logging_strategy="steps"
     load_best_model_at_end: bool = True
     metric_for_best_model: str = "eval_loss"
+    # Сколько чекпоинтов хранить на диске (None = все; рекомендуется 2-3)
+    # Модель ~2 ГБ × save_total_limit = место на диске
+    save_total_limit: int = 2
 
     # ── Ранняя остановка ─────────────────────────────────────────────────────
     # 0 = выключено; supervised — по eval_loss, unsupervised — по train_loss
@@ -486,6 +489,7 @@ class EmbeddingTrainer:
             seed=self.config.seed,
             dataloader_num_workers=self.config.dataloader_num_workers,
             batch_sampler=batch_sampler,
+            save_total_limit=self.config.save_total_limit,
             report_to="none",
         )
 
