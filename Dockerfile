@@ -23,8 +23,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && update-alternatives --install /usr/bin/python  python  /usr/bin/python3.11 1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Устанавливаем pip напрямую для Python 3.11 (не через apt python3-pip)
-RUN curl -sS https://bootstrap.pypa.io/get-pip.py | python3.11 && \
+# Устанавливаем pip через встроенный ensurepip (не требует distutils и сети)
+RUN python3.11 -m ensurepip --upgrade && \
     python3.11 -m pip install --upgrade pip setuptools wheel
 
 WORKDIR /workspace
