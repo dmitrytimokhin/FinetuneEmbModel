@@ -469,13 +469,18 @@ class EmbeddingTrainer:
         save_strategy_val = "epoch"
         load_best = self.config.load_best_model_at_end and has_eval
 
+        # warmup_steps должен быть int — вычисляем из ratio
+        steps_per_epoch = max(1, len(train_dataset) // self.config.batch_size)
+        total_steps = steps_per_epoch * self.config.num_epochs
+        warmup_steps = max(1, int(total_steps * self.config.warmup_ratio))
+
         training_args = SentenceTransformerTrainingArguments(
             output_dir=self.config.output_dir,
             num_train_epochs=self.config.num_epochs,
             per_device_train_batch_size=self.config.batch_size,
             per_device_eval_batch_size=self.config.batch_size,
             learning_rate=self.config.learning_rate,
-            warmup_steps=self.config.warmup_ratio,
+            warmup_steps=warmup_steps,
             weight_decay=self.config.weight_decay,
             gradient_accumulation_steps=self.config.gradient_accumulation_steps,
             fp16=self.config.fp16,
