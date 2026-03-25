@@ -13,7 +13,6 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3.11 \
         python3.11-dev \
-        python3-pip \
         python3.11-venv \
         git \
         wget \
@@ -24,7 +23,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && update-alternatives --install /usr/bin/python  python  /usr/bin/python3.11 1 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN python -m pip install --upgrade pip setuptools wheel
+# Устанавливаем pip напрямую для Python 3.11 (не через apt python3-pip)
+RUN curl -sS https://bootstrap.pypa.io/get-pip.py | python3.11 && \
+    python3.11 -m pip install --upgrade pip setuptools wheel
 
 WORKDIR /workspace
 
@@ -34,8 +35,10 @@ RUN pip install torch torchvision torchaudio \
 
 # ── 2. Остальные зависимости из requirements.txt (torch уже установлен) ───────
 COPY requirements.txt .
-# Фильтруем строки torch — pip может перезаписать GPU-версию CPU-пакетом с PyPI
-RUN grep -vE "^torch" requirements.txt | pip install -r /dev/stdin
+# Фильтруем строки torch и пишем во временный файл (stdin-pipe ненадёжен в sh)
+RUN grep -vE "^torch" requirements.txt > /tmp/req_filtered.txt && \
+    pip install -r /tmp/req_filtered.txt && \
+    rm /tmp/req_filtered.txt
 
 # ── 3. JupyterLab (заменяет классический jupyter из requirements.txt) ─────────
 RUN pip install "jupyterlab>=4.1.0" jupyter-contrib-nbextensions

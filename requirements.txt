@@ -20,7 +20,7 @@ matplotlib>=3.8.0
 seaborn>=0.13.0
 
 # ── Notebook ─────────────────────────────────────────────────────────────────
-jupyter>=1.0.0
+# jupyter и jupyterlab устанавливаются отдельным шагом в Dockerfile
 ipykernel>=6.29.0
 ipywidgets>=8.1.0
 
