@@ -374,28 +374,21 @@ class EmbeddingTrainer:
             )
 
         elif loss_type == LossType.TSDAE:
-            # Пытаемся использовать DenoisingAutoEncoderLoss (sentence-transformers
-            # + transformers < 5.0.0). Если недоступен или несовместим —
-            # переходим на MNRL по парам (noised, original): это SimCSE-стиль,
-            # дающий аналогичный эффект доменной адаптации без seq2seq-архитектуры.
-            try:
-                from sentence_transformers.losses import DenoisingAutoEncoderLoss
-                loss = DenoisingAutoEncoderLoss(
-                    model=self.model,
-                    tie_encoder_decoder=True,
-                )
-                logger.info("TSDAE: используется DenoisingAutoEncoderLoss")
-                return loss
-            except (ImportError, RuntimeError) as exc:
-                logger.warning(
-                    "DenoisingAutoEncoderLoss недоступен (%s). "
-                    "Переключаемся на MNRL(noised, original) — SimCSE-стиль доменной адаптации.",
-                    exc,
-                )
-                return MultipleNegativesRankingLoss(
-                    model=self.model,
-                    scale=1.0 / self.config.temperature,
-                )
+            # USER-bge-m3 — encoder-only (XLM-RoBERTa).
+            # DenoisingAutoEncoderLoss создаёт decoder с ~200 рандомными тензорами,
+            # большинство градиентов уходит в decoder, а не в encoder-эмбеддинги.
+            # Эффективнее: MNRL на парах (noised → clean) — SimCSE-стиль,
+            # напрямую обучает encoder-пространство без seq2seq overhead.
+            from sentence_transformers import util as st_util
+            logger.info(
+                "TSDAE: SimCSE-MNRL на парах (noised, original) "
+                "— encoder-only режим, без seq2seq decoder"
+            )
+            return MultipleNegativesRankingLoss(
+                model=self.model,
+                scale=1.0 / self.config.temperature,
+                similarity_fct=st_util.cos_sim,
+            )
 
         raise ValueError(f"Неизвестный тип loss: {loss_type}")
 
