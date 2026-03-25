@@ -250,3 +250,7 @@ secrets.json
 # ── Claude Code ───────────────────────────────────────────────────────────────
 # settings.local.json — локальные разрешения инструментов, специфичны для машины
 .claude/settings.local.json
+
+.Trash/
+**/.Trash/
+**/.Trash-*/
