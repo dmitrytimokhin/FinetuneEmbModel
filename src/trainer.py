@@ -25,6 +25,7 @@ trainer.py
 
 from __future__ import annotations
 
+import copy
 import logging
 import math
 import os
@@ -32,6 +33,10 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional
+
+# Отключаем параллелизм токенизатора до форка DataLoader-воркеров,
+# иначе HuggingFace tokenizers выдаёт предупреждения о deadlock.
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 import pandas as pd
 import torch
@@ -183,8 +188,10 @@ class _EpochLogCallback(TrainerCallback):
 class _EarlyStoppingOnTrainLoss(TrainerCallback):
     """
     Ранняя остановка по train_loss — для unsupervised этапа (без eval_dataset).
-    При каждом улучшении сохраняет лучшую модель в `best_model_dir`.
-    Останавливает обучение если `patience` эпох подряд нет улучшения.
+
+    Лучшие веса хранятся в памяти (_best_state) и записываются на диск
+    один раз в on_train_end — так же, как ведут себя supervised-методы
+    (load_best_model_at_end + save в конце).
     """
 
     def __init__(self, patience: int, best_model_dir: str) -> None:
@@ -192,6 +199,7 @@ class _EarlyStoppingOnTrainLoss(TrainerCallback):
         self.best_model_dir = best_model_dir
         self.best_loss = float("inf")
         self.no_improve = 0
+        self._best_state: Optional[dict] = None   # веса лучшей эпохи в памяти
 
     def on_log(self, args, state, control, logs=None, model=None, **kwargs):
         if not logs or "loss" not in logs:
@@ -202,11 +210,12 @@ class _EarlyStoppingOnTrainLoss(TrainerCallback):
         if loss < self.best_loss - 1e-5:
             self.best_loss = loss
             self.no_improve = 0
+            # Сохраняем веса в RAM — без записи на диск
             if model is not None:
-                model.save(self.best_model_dir)
+                self._best_state = copy.deepcopy(model.state_dict())
             logger.info(
-                "EarlyStopping [train] epoch=%.0f: loss=%.4f ↓ (best saved → %s)",
-                epoch, loss, self.best_model_dir,
+                "EarlyStopping [train] epoch=%.0f: loss=%.4f ↓ (best в памяти)",
+                epoch, loss,
             )
         else:
             self.no_improve += 1
@@ -219,6 +228,18 @@ class _EarlyStoppingOnTrainLoss(TrainerCallback):
                     "Ранняя остановка: %d эпох без улучшения train_loss.", self.patience
                 )
                 control.should_training_stop = True
+
+    def on_train_end(self, args, state, control, model=None, **kwargs):
+        """Восстанавливаем лучшие веса и сохраняем на диск один раз."""
+        if model is None:
+            return
+        if self._best_state is not None:
+            model.load_state_dict(self._best_state)
+            logger.info(
+                "Восстановлены лучшие веса (loss=%.4f)", self.best_loss
+            )
+        model.save(self.best_model_dir)
+        logger.info("Лучшая модель сохранена → %s", self.best_model_dir)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
