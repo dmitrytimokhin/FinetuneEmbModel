@@ -40,6 +40,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 from rank_bm25 import BM25Okapi
 from tqdm import tqdm
@@ -116,13 +117,14 @@ class BM25HardNegativeMiner:
         query_tokens = re.sub(r"[^\w\s]", " ", query.lower()).split()
         scores = self.bm25.get_scores(query_tokens)
 
-        ranked = sorted(
-            range(len(self.chunks)),
-            key=lambda i: scores[i],
-            reverse=True,
-        )
+        # np.argpartition — O(n) вместо O(n log n) полной сортировки.
+        # Берём top_k * 4 кандидатов с запасом (часть отсеется по exclude_doc_id).
+        k = min(top_k * 4, len(scores))
+        top_indices = np.argpartition(scores, -k)[-k:]
+        top_indices = top_indices[np.argsort(-scores[top_indices])]
+
         result: List[Chunk] = []
-        for idx in ranked:
+        for idx in top_indices:
             chunk = self.chunks[idx]
             if chunk.doc_id != exclude_doc_id:
                 result.append(chunk)
@@ -173,15 +175,34 @@ class TripletSampler:
         negative_strategy: str = "bm25",
         n_hard_neg_pool: int = 10,
         seed: int = 42,
+        max_chunks: Optional[int] = None,
     ) -> None:
         if not chunks:
             raise ValueError("Список чанков не может быть пустым")
 
-        self.chunks = chunks
         self.negative_strategy = negative_strategy
         self.n_hard_neg_pool = n_hard_neg_pool
         self.seed = seed
         random.seed(seed)
+
+        # Ограничиваем корпус если задан max_chunks.
+        # Выборка стратифицирована по doc_id — берём пропорционально из каждого документа.
+        if max_chunks and len(chunks) > max_chunks:
+            by_doc: Dict[str, List[Chunk]] = {}
+            for c in chunks:
+                by_doc.setdefault(c.doc_id, []).append(c)
+            sampled: List[Chunk] = []
+            ratio = max_chunks / len(chunks)
+            for doc_chunks in by_doc.values():
+                k = max(1, round(len(doc_chunks) * ratio))
+                sampled.extend(random.sample(doc_chunks, min(k, len(doc_chunks))))
+            chunks = sampled[:max_chunks]
+            logger.info(
+                "max_chunks=%d: корпус сокращён %d → %d чанков",
+                max_chunks, len(sampled), len(chunks),
+            )
+
+        self.chunks = chunks
 
         # Индексы: doc_id -> список чанков
         self._by_doc: Dict[str, List[Chunk]] = {}
@@ -312,15 +333,26 @@ class TripletSampler:
         words = text.split()[:max_words]
         return " ".join(words).strip(".,;:—")
 
-    def sample_query_template(self, n_per_chunk: int = 1) -> List[Triplet]:
+    def sample_query_template(
+        self,
+        n_per_chunk: int = 1,
+        max_chunks_qt: Optional[int] = None,
+    ) -> List[Triplet]:
         """
         Anchor = синтетический запрос по шаблону.
         Positive = исходный чанк.
         Negative = BM25-hard из другого документа.
+
+        max_chunks_qt : ограничить число чанков для этой стратегии
+                        (BM25-поиск дорогой на больших корпусах).
         """
         triplets: List[Triplet] = []
+        pool = self.chunks
+        if max_chunks_qt and len(pool) > max_chunks_qt:
+            pool = random.sample(pool, max_chunks_qt)
+            logger.info("query_template: ограничено до %d чанков", max_chunks_qt)
 
-        for chunk in tqdm(self.chunks, desc="query_template", leave=False):
+        for chunk in tqdm(pool, desc="query_template", leave=False):
             topic = self._extract_topic(chunk.text)
             neg_chunk = self._get_negative(chunk)
             if neg_chunk is None:
@@ -349,6 +381,7 @@ class TripletSampler:
         strategies: Optional[List[str]] = None,
         n_per_chunk: int = 1,
         deduplicate: bool = True,
+        max_chunks_qt: Optional[int] = None,
     ) -> pd.DataFrame:
         """
         Формирует итоговый DataFrame со всеми триплетами.
@@ -376,7 +409,9 @@ class TripletSampler:
             elif strategy == "section":
                 all_triplets.extend(self.sample_section(n_per_chunk))
             elif strategy == "query_template":
-                all_triplets.extend(self.sample_query_template(n_per_chunk))
+                all_triplets.extend(
+                    self.sample_query_template(n_per_chunk, max_chunks_qt=max_chunks_qt)
+                )
             else:
                 raise ValueError(f"Неизвестная стратегия: {strategy!r}")
 
