@@ -446,6 +446,250 @@ class TripletSampler:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Markdown Document Processor
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Диапазоны Unicode для эмоджи и спецсимволов
+_EMOJI_RE = re.compile(
+    "["
+    "\U0001F600-\U0001F64F"   # emoticons
+    "\U0001F300-\U0001F5FF"   # symbols & pictographs
+    "\U0001F680-\U0001F6FF"   # transport & map
+    "\U0001F1E0-\U0001F1FF"   # flags
+    "\U00002500-\U00002BEF"   # chinese/japanese/korean
+    "\U00002702-\U000027B0"
+    "\U000024C2-\U0001F251"
+    "\U0001f926-\U0001f937"
+    "\U00010000-\U0010ffff"
+    "\u2640-\u2642"
+    "\u2600-\u2B55"
+    "\u200d\u23cf\u23e9\u231a\ufe0f\u3030"
+    "]+",
+    flags=re.UNICODE,
+)
+
+# Паттерн разбивки на предложения: точка / ! / ? → конец предложения
+# Смотрим за 1+ пробельных символов и заглавной буквы или цифры следующего
+_SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+class MarkdownDocumentProcessor:
+    """
+    Очищает markdown-документы и нарезает их на чанки из законченных предложений.
+
+    Этапы
+    -----
+    1. clean(text)       — убирает markdown-разметку, HTML, эмоджи, лишние символы
+    2. split_sentences() — разбивает очищенный текст на предложения
+    3. analyze_lengths() — считает распределение длин предложений (слова)
+    4. build_chunks()    — объединяет предложения в чанки с перекрытием 1 предложение
+    5. process_df()      — обрабатывает весь DataFrame сразу → List[Chunk]
+
+    Параметры
+    ---------
+    sentences_per_chunk : int | None
+        Если None — определяется автоматически из медианы длин предложений
+        с целью ~target_words_per_chunk слов в чанке.
+    target_words_per_chunk : int
+        Целевой размер чанка в словах (используется при автовыборе sentences_per_chunk).
+    min_sentence_words : int
+        Предложения короче этого порога отбрасываются (колонтитулы, заголовки).
+    """
+
+    def __init__(
+        self,
+        sentences_per_chunk: Optional[int] = None,
+        target_words_per_chunk: int = 120,
+        min_sentence_words: int = 5,
+    ) -> None:
+        self.sentences_per_chunk = sentences_per_chunk
+        self.target_words_per_chunk = target_words_per_chunk
+        self.min_sentence_words = min_sentence_words
+
+    # ── Шаг 1: Очистка текста ────────────────────────────────────────────────
+
+    def clean(self, text: str) -> str:
+        """Убирает markdown, HTML, эмоджи; оставляет буквы, цифры и точки."""
+        # Markdown: блоки кода ```...```
+        text = re.sub(r"```[\s\S]*?```", " ", text)
+        # Markdown: инлайн-код `...`
+        text = re.sub(r"`[^`]+`", " ", text)
+        # Markdown: изображения ![alt](url)
+        text = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", text)
+        # Markdown: ссылки [текст](url) → оставляем текст
+        text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+        # Markdown: заголовки # ## ###
+        text = re.sub(r"^\s*#{1,6}\s+", " ", text, flags=re.MULTILINE)
+        # Markdown: жирный/курсив **text** *text* __text__ _text_
+        text = re.sub(r"(\*{1,3}|_{1,3})(.+?)\1", r"\2", text)
+        # Markdown: горизонтальные линии --- *** ___
+        text = re.sub(r"^\s*[-*_]{3,}\s*$", " ", text, flags=re.MULTILINE)
+        # Markdown: таблицы (строки с |)
+        text = re.sub(r"^\s*\|.*\|\s*$", " ", text, flags=re.MULTILINE)
+        text = re.sub(r"^\s*[-|: ]+\s*$", " ", text, flags=re.MULTILINE)
+        # HTML-теги
+        text = re.sub(r"<[^>]+>", " ", text)
+        # HTML-сущности &nbsp; &amp; и т.д.
+        text = re.sub(r"&[a-zA-Z]{2,6};", " ", text)
+        # Эмоджи
+        text = _EMOJI_RE.sub(" ", text)
+        # Спецсимволы: оставляем буквы, цифры, пробел, точку, запятую, дефис, скобки
+        # Запятая нужна чтобы не терять числа типа "1,5%"; дефис — для составных слов
+        text = re.sub(r"[^\w\s.,;:\-—()\[\]]", " ", text, flags=re.UNICODE)
+        # Множественные пробелы и пустые строки → один пробел
+        text = re.sub(r"[ \t]+", " ", text)
+        text = re.sub(r"\n{2,}", ". ", text)   # двойной перенос = конец абзаца
+        text = re.sub(r"\n", " ", text)
+        # Множественные точки → одна
+        text = re.sub(r"\.{2,}", ".", text)
+        # Пробел перед точкой → убрать
+        text = re.sub(r"\s+\.", ".", text)
+        return text.strip()
+
+    # ── Шаг 2: Разбивка на предложения ───────────────────────────────────────
+
+    def split_sentences(self, text: str) -> List[str]:
+        """Разбивает очищенный текст на непустые предложения."""
+        parts = _SENT_SPLIT_RE.split(text)
+        sentences = []
+        for s in parts:
+            s = s.strip().strip(".")
+            if len(s.split()) >= self.min_sentence_words:
+                sentences.append(s)
+        return sentences
+
+    # ── Шаг 3: Анализ длин предложений ───────────────────────────────────────
+
+    def analyze_lengths(self, all_sentences: List[str]) -> Dict:
+        """
+        Считает статистику длин предложений (в словах).
+        Возвращает словарь с percentiles и рекомендованным sentences_per_chunk.
+        """
+        lengths = np.array([len(s.split()) for s in all_sentences])
+        p25, p50, p75, p90 = np.percentile(lengths, [25, 50, 75, 90])
+        median = float(p50)
+        recommended = max(2, round(self.target_words_per_chunk / median))
+
+        stats = {
+            "count":           len(lengths),
+            "mean":            float(lengths.mean()),
+            "median":          median,
+            "p25":             float(p25),
+            "p75":             float(p75),
+            "p90":             float(p90),
+            "max":             int(lengths.max()),
+            "min":             int(lengths.min()),
+            "recommended_spc": recommended,   # sentences_per_chunk
+        }
+        logger.info(
+            "Длины предложений: median=%.1f слов | p25=%.1f p75=%.1f p90=%.1f "
+            "| рекомендуется sentences_per_chunk=%d (цель ~%d слов/чанк)",
+            stats["median"], stats["p25"], stats["p75"], stats["p90"],
+            recommended, self.target_words_per_chunk,
+        )
+        return stats
+
+    # ── Шаг 4: Сборка чанков ─────────────────────────────────────────────────
+
+    def build_chunks(
+        self,
+        sentences: List[str],
+        doc_id: str,
+        spc: int,
+    ) -> List[Chunk]:
+        """
+        Объединяет предложения в чанки по spc штук с перекрытием 1 предложение слева.
+
+        Пример при spc=3, предложения [A, B, C, D, E, F]:
+          чанк 0: [A, B, C]
+          чанк 1: [C, D, E]   ← C — перекрытие с предыдущим
+          чанк 2: [E, F]      ← последний может быть короче
+        """
+        chunks: List[Chunk] = []
+        step = spc - 1   # шаг = spc минус 1 перекрывающееся предложение
+        i = 0
+        chunk_idx = 0
+        while i < len(sentences):
+            window = sentences[i: i + spc]
+            text = ". ".join(window) + "."
+            chunks.append(Chunk(
+                text=text,
+                doc_id=doc_id,
+                chunk_id=f"{doc_id}_c{chunk_idx:04d}",
+            ))
+            chunk_idx += 1
+            i += step
+        return chunks
+
+    # ── Шаг 5: Обработка DataFrame ───────────────────────────────────────────
+
+    def process_df(
+        self,
+        df: pd.DataFrame,
+        doc_col: str = "filename",
+        text_col: str = "full_text",
+    ) -> List[Chunk]:
+        """
+        Обрабатывает DataFrame с документами → List[Chunk] для TSDAE.
+
+        Параметры
+        ---------
+        df       : DataFrame с колонками doc_col и text_col
+        doc_col  : имя колонки с идентификатором документа
+        text_col : имя колонки с полным текстом документа
+
+        Возвращает
+        ----------
+        List[Chunk] готовый для TripletSampler или для corpus.csv
+        """
+        # Проход 1: очищаем и собираем все предложения для анализа длин
+        all_sentences: List[str] = []
+        cleaned_docs: List[Tuple[str, List[str]]] = []
+
+        logger.info("Очистка %d документов...", len(df))
+        for _, row in tqdm(df.iterrows(), total=len(df), desc="clean"):
+            doc_id = str(row[doc_col])
+            cleaned = self.clean(str(row[text_col]))
+            sents = self.split_sentences(cleaned)
+            cleaned_docs.append((doc_id, sents))
+            all_sentences.extend(sents)
+
+        if not all_sentences:
+            logger.warning("Ни одного предложения не извлечено. Проверьте входные данные.")
+            return []
+
+        # Анализ длин → автовыбор sentences_per_chunk если не задан
+        stats = self.analyze_lengths(all_sentences)
+        spc = self.sentences_per_chunk or stats["recommended_spc"]
+        logger.info("sentences_per_chunk=%d (перекрытие=1 предложение)", spc)
+
+        # Проход 2: собираем чанки
+        all_chunks: List[Chunk] = []
+        for doc_id, sents in tqdm(cleaned_docs, desc="chunk"):
+            if not sents:
+                continue
+            all_chunks.extend(self.build_chunks(sents, doc_id, spc))
+
+        logger.info(
+            "Итого: %d документов → %d чанков (spc=%d)",
+            len(df), len(all_chunks), spc,
+        )
+        return all_chunks
+
+    @staticmethod
+    def chunks_to_df(chunks: List[Chunk]) -> pd.DataFrame:
+        """Конвертирует List[Chunk] в DataFrame формата corpus.csv."""
+        return pd.DataFrame([
+            {
+                "doc_id":   c.doc_id,
+                "chunk_id": c.chunk_id,
+                "sentence": c.text,
+            }
+            for c in chunks
+        ])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Document Chunker
 # ─────────────────────────────────────────────────────────────────────────────
 

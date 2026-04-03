@@ -128,6 +128,17 @@ class TrainingConfig:
     # TSDAE-специфично
     tsdae_noise_ratio: float = 0.6
 
+    # ── Частичная разморозка (layer-wise fine-tuning) ─────────────────────────
+    # -1 = все слои разморожены (стандартное full fine-tuning, default)
+    #  0 = заморожена вся модель, обучается только pooling-слой
+    #  N = разморожены последние N encoder-слоёв + pooling
+    # Рекомендации: N=2–4 для TSDAE, N=4–6 для supervised fine-tuning
+    unfreeze_last_n_layers: int = -1
+    # Изменить dropout во последних M encoder-слоях (0 = не менять)
+    # Увеличение p (0.1→0.2) добавляет регуляризацию для малых корпусов
+    dropout_last_m_layers: int = 0
+    dropout_p: float = 0.1
+
     def auto_adjust_for_device(self, device: str) -> None:
         """Автонастройка гиперпараметров под устройство."""
         if device == "cpu":
@@ -307,6 +318,8 @@ class EmbeddingTrainer:
             "Модель загружена. max_seq_length=%d", config.max_seq_length
         )
 
+        self._apply_layer_config()
+
     # ── Device detection ─────────────────────────────────────────────────────
 
     @staticmethod
@@ -316,6 +329,86 @@ class EmbeddingTrainer:
         if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             return "mps"
         return "cpu"
+
+    # ── Layer-wise freeze / dropout ──────────────────────────────────────────
+
+    def _apply_layer_config(self) -> None:
+        """
+        Замораживает все слои кроме последних unfreeze_last_n_layers
+        и/или меняет dropout в последних dropout_last_m_layers слоях.
+
+        Пропускается (no-op) при unfreeze_last_n_layers=-1 и dropout_last_m_layers=0.
+
+        Схема заморозки
+        ---------------
+        -1  → full fine-tuning (ничего не меняем)
+         0  → заморожен весь encoder; обучается только pooling
+         N  → заморожены слои 0...(total-N-1); разморожены последние N + pooling
+
+        Метод универсален: работает для любой HuggingFace-модели с
+        auto_model.encoder.layer (BERT, RoBERTa, XLM-RoBERTa, ...).
+        """
+        cfg = self.config
+        if cfg.unfreeze_last_n_layers == -1 and cfg.dropout_last_m_layers == 0:
+            return  # full fine-tuning — ничего не делаем
+
+        # Transformer-модуль — первый элемент SentenceTransformer
+        transformer_module = self.model[0]
+        auto_model = transformer_module.auto_model
+
+        try:
+            encoder_layers = list(auto_model.encoder.layer)
+        except AttributeError:
+            logger.warning(
+                "Не удалось получить encoder.layer — "
+                "unfreeze/dropout config пропускается"
+            )
+            return
+
+        n_layers = len(encoder_layers)
+
+        # ── Заморозка ─────────────────────────────────────────────────────────
+        if cfg.unfreeze_last_n_layers >= 0:
+            # Шаг 1: заморозить всё
+            for param in self.model.parameters():
+                param.requires_grad = False
+
+            # Шаг 2: разморозить последние N encoder-слоёв
+            unfreeze_from = max(0, n_layers - cfg.unfreeze_last_n_layers)
+            for layer in encoder_layers[unfreeze_from:]:
+                for param in layer.parameters():
+                    param.requires_grad = True
+
+            # Шаг 3: разморозить pooling (model[1]) — нужен всегда
+            if len(self.model) > 1:
+                for param in self.model[1].parameters():
+                    param.requires_grad = True
+
+            total     = sum(p.numel() for p in self.model.parameters())
+            trainable = sum(p.numel() for p in self.model.parameters()
+                            if p.requires_grad)
+            logger.info(
+                "Layer freeze: разморожены последние %d/%d слоёв + pooling. "
+                "Обучаемых параметров: %s / %s (%.1f%%)",
+                cfg.unfreeze_last_n_layers, n_layers,
+                f"{trainable:,}", f"{total:,}",
+                100.0 * trainable / max(total, 1),
+            )
+
+        # ── Dropout ───────────────────────────────────────────────────────────
+        if cfg.dropout_last_m_layers > 0:
+            import torch.nn as nn
+            dropout_from = max(0, n_layers - cfg.dropout_last_m_layers)
+            changed = 0
+            for layer in encoder_layers[dropout_from:]:
+                for module in layer.modules():
+                    if isinstance(module, nn.Dropout):
+                        module.p = cfg.dropout_p
+                        changed += 1
+            logger.info(
+                "Dropout: изменено %d модулей в последних %d/%d слоях → p=%.2f",
+                changed, cfg.dropout_last_m_layers, n_layers, cfg.dropout_p,
+            )
 
     # ── Dataset preparation ──────────────────────────────────────────────────
 
