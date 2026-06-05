@@ -713,3 +713,418 @@ def make_gpu_config(
         logging_steps=20,
         dataloader_num_workers=4,
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Reranker (Cross-Encoder) — Config & Trainer
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class RerankerConfig:
+    """
+    Конфигурация дообучения CrossEncoder-реранкера.
+
+    Из триплетов (anchor, positive, negative) автоматически формируются пары:
+        (anchor, positive) → label = 1.0
+        (anchor, negative) → label = 0.0
+
+    CPU-рекомендации:
+      batch_size=4, gradient_accumulation_steps=8, num_epochs=3
+    GPU-рекомендации:
+      batch_size=16, gradient_accumulation_steps=1, fp16=True
+    """
+
+    # ── Модель ───────────────────────────────────────────────────────────────
+    model_name: str = "BAAI/bge-reranker-v2-m3"
+    max_seq_length: int = 512
+
+    # ── Обучение ─────────────────────────────────────────────────────────────
+    num_epochs: int = 3
+    batch_size: int = 16
+    learning_rate: float = 2e-5
+    warmup_ratio: float = 0.1
+    weight_decay: float = 0.01
+    gradient_accumulation_steps: int = 1
+
+    # ── Precision ────────────────────────────────────────────────────────────
+    fp16: bool = False
+    bf16: bool = False
+
+    # ── Checkpointing ────────────────────────────────────────────────────────
+    output_dir: str = "./output"
+    save_total_limit: int = 2
+    logging_steps: int = 10
+    logging_strategy: str = "epoch"
+
+    # ── Ранняя остановка ─────────────────────────────────────────────────────
+    early_stopping_patience: int = 3
+
+    # ── Misc ─────────────────────────────────────────────────────────────────
+    seed: int = 42
+    dataloader_num_workers: int = 0
+
+    # ── Частичная разморозка (layer-wise fine-tuning) ─────────────────────────
+    # Рекомендации для bge-reranker-v2-m3 (24 слоя XLM-RoBERTa-large):
+    #   лёгкое: N=4,  умеренное: N=6,  агрессивное: N=8
+    unfreeze_last_n_layers: int = -1
+    dropout_last_m_layers: int = 0
+    dropout_p: float = 0.1
+
+    def auto_adjust_for_device(self, device: str) -> None:
+        if device == "cpu":
+            if self.batch_size > 8:
+                logger.info("CPU режим: batch_size %d → 4", self.batch_size)
+                self.batch_size = 4
+            if self.gradient_accumulation_steps < 4:
+                self.gradient_accumulation_steps = 8
+            self.fp16 = False
+            self.bf16 = False
+            self.dataloader_num_workers = 0
+        else:
+            if not self.fp16 and not self.bf16:
+                if torch.cuda.is_bf16_supported():
+                    self.bf16 = True
+                    logger.info("GPU: включён bf16")
+                else:
+                    self.fp16 = True
+                    logger.info("GPU: включён fp16")
+
+
+class RerankerTrainer:
+    """
+    Дообучение CrossEncoder-реранкера (sentence-transformers CrossEncoder).
+
+    Поддерживает два бэкенда:
+    - ST >= 3.x: CrossEncoderTrainer (предпочтительный)
+    - Fallback:  CrossEncoder.fit()  (старый API, работает всегда)
+
+    Пример
+    ------
+    >>> cfg = RerankerConfig(
+    ...     model_name="BAAI/bge-reranker-v2-m3",
+    ...     learning_rate=2e-5,
+    ...     unfreeze_last_n_layers=6,
+    ... )
+    >>> trainer = RerankerTrainer(cfg)
+    >>> trainer.train(train_df, eval_df)
+    >>> trainer.save_model("./output/best_reranker")
+    """
+
+    def __init__(self, config: RerankerConfig) -> None:
+        self.config = config
+        self.device = EmbeddingTrainer._detect_device()
+        logger.info("Устройство: %s", self.device)
+
+        config.auto_adjust_for_device(self.device)
+
+        from sentence_transformers import CrossEncoder
+        logger.info("Загрузка реранкера: %s", config.model_name)
+        self.model = CrossEncoder(
+            config.model_name,
+            max_length=config.max_seq_length,
+            device=self.device,
+        )
+        logger.info("Реранкер загружен.")
+
+        self._apply_layer_config()
+
+    # ── Layer-wise freeze / dropout ──────────────────────────────────────────
+
+    def _apply_layer_config(self) -> None:
+        """
+        Заморозка encoder-слоёв и изменение dropout.
+        CrossEncoder хранит HF-модель в self.model.model.
+        """
+        cfg = self.config
+        if cfg.unfreeze_last_n_layers == -1 and cfg.dropout_last_m_layers == 0:
+            return
+
+        hf_model = self.model.model
+
+        try:
+            encoder_layers = list(hf_model.encoder.layer)
+        except AttributeError:
+            logger.warning(
+                "Не удалось получить encoder.layer у реранкера — layer config пропускается"
+            )
+            return
+
+        n_layers = len(encoder_layers)
+
+        if cfg.unfreeze_last_n_layers >= 0:
+            for param in hf_model.parameters():
+                param.requires_grad = False
+
+            unfreeze_from = max(0, n_layers - cfg.unfreeze_last_n_layers)
+            for layer in encoder_layers[unfreeze_from:]:
+                for param in layer.parameters():
+                    param.requires_grad = True
+
+            # Classifier head — всегда разморожен (иначе нечего обучать)
+            for name, module in hf_model.named_children():
+                if name not in ("embeddings", "encoder", "pooler"):
+                    for param in module.parameters():
+                        param.requires_grad = True
+
+            total     = sum(p.numel() for p in hf_model.parameters())
+            trainable = sum(p.numel() for p in hf_model.parameters()
+                            if p.requires_grad)
+            logger.info(
+                "Reranker freeze: разморожены последние %d/%d слоёв + head. "
+                "Обучаемых: %s / %s (%.1f%%)",
+                cfg.unfreeze_last_n_layers, n_layers,
+                f"{trainable:,}", f"{total:,}",
+                100.0 * trainable / max(total, 1),
+            )
+
+        if cfg.dropout_last_m_layers > 0:
+            import torch.nn as nn
+            dropout_from = max(0, n_layers - cfg.dropout_last_m_layers)
+            changed = 0
+            for layer in encoder_layers[dropout_from:]:
+                for module in layer.modules():
+                    if isinstance(module, nn.Dropout):
+                        module.p = cfg.dropout_p
+                        changed += 1
+            logger.info(
+                "Dropout: изменено %d модулей в последних %d/%d слоях → p=%.2f",
+                changed, cfg.dropout_last_m_layers, n_layers, cfg.dropout_p,
+            )
+
+    # ── Dataset ──────────────────────────────────────────────────────────────
+
+    def prepare_dataset(self, df: pd.DataFrame) -> Dataset:
+        """
+        Конвертирует DataFrame с триплетами → Dataset для CrossEncoderTrainer.
+
+        Из каждой строки (anchor, positive, negative) создаём 2 примера:
+            (anchor, positive) → label = 1.0
+            (anchor, negative) → label = 0.0
+        """
+        s1, s2, labels = [], [], []
+        for _, row in df.iterrows():
+            s1.append(str(row["anchor"]))
+            s2.append(str(row["positive"]))
+            labels.append(1.0)
+
+            s1.append(str(row["anchor"]))
+            s2.append(str(row["negative"]))
+            labels.append(0.0)
+
+        return Dataset.from_dict({"sentence_A": s1, "sentence_B": s2, "label": labels})
+
+    # ── Loss ─────────────────────────────────────────────────────────────────
+
+    def _build_loss(self):
+        """BinaryCrossEntropyLoss если доступен, иначе None (авто-выбор трейнером)."""
+        try:
+            from sentence_transformers.cross_encoder.losses import BinaryCrossEntropyLoss
+            return BinaryCrossEntropyLoss(model=self.model)
+        except ImportError:
+            return None
+
+    # ── Train ────────────────────────────────────────────────────────────────
+
+    def train(
+        self,
+        train_df: pd.DataFrame,
+        eval_df: Optional[pd.DataFrame] = None,
+    ) -> None:
+        """Запускает дообучение реранкера (ST 3.x → fallback на .fit())."""
+        logger.info(
+            "Подготовка датасета: %d триплетов → %d пар",
+            len(train_df), len(train_df) * 2,
+        )
+
+        train_dataset = self.prepare_dataset(train_df)
+        eval_dataset  = self.prepare_dataset(eval_df) if eval_df is not None else None
+        has_eval      = eval_dataset is not None
+
+        steps_per_epoch = max(1, len(train_dataset) // self.config.batch_size)
+        warmup_steps    = max(1, int(
+            steps_per_epoch * self.config.num_epochs * self.config.warmup_ratio
+        ))
+
+        best_model_dir = os.path.join(self.config.output_dir, "best_reranker")
+
+        callbacks: List = [_EpochLogCallback()]
+        if self.config.early_stopping_patience > 0:
+            if has_eval:
+                from transformers import EarlyStoppingCallback as _ESC
+                callbacks.append(_ESC(
+                    early_stopping_patience=self.config.early_stopping_patience,
+                ))
+            else:
+                callbacks.append(_EarlyStoppingOnTrainLoss(
+                    patience=self.config.early_stopping_patience,
+                    best_model_dir=best_model_dir,
+                ))
+
+        try:
+            self._train_v3(
+                train_dataset, eval_dataset, warmup_steps,
+                has_eval, best_model_dir, callbacks,
+            )
+        except (ImportError, TypeError, AttributeError) as exc:
+            logger.warning(
+                "CrossEncoderTrainer недоступен (%s) → fallback на CrossEncoder.fit()", exc
+            )
+            self._train_legacy(train_df, eval_df, warmup_steps, best_model_dir)
+
+    def _train_v3(
+        self,
+        train_dataset,
+        eval_dataset,
+        warmup_steps: int,
+        has_eval: bool,
+        best_model_dir: str,
+        callbacks: List,
+    ) -> None:
+        """Обучение через CrossEncoderTrainer (ST >= 3.0)."""
+        from sentence_transformers.cross_encoder.trainer import CrossEncoderTrainer
+        from sentence_transformers.cross_encoder.training_args import (
+            CrossEncoderTrainingArguments,
+        )
+
+        loss = self._build_loss()
+
+        args = CrossEncoderTrainingArguments(
+            output_dir=self.config.output_dir,
+            num_train_epochs=self.config.num_epochs,
+            per_device_train_batch_size=self.config.batch_size,
+            per_device_eval_batch_size=self.config.batch_size,
+            learning_rate=self.config.learning_rate,
+            warmup_steps=warmup_steps,
+            weight_decay=self.config.weight_decay,
+            gradient_accumulation_steps=self.config.gradient_accumulation_steps,
+            fp16=self.config.fp16,
+            bf16=self.config.bf16,
+            eval_strategy="epoch" if has_eval else "no",
+            save_strategy="epoch",
+            logging_strategy=self.config.logging_strategy,
+            logging_steps=self.config.logging_steps,
+            load_best_model_at_end=has_eval,
+            metric_for_best_model="eval_loss",
+            save_total_limit=self.config.save_total_limit,
+            seed=self.config.seed,
+            dataloader_num_workers=self.config.dataloader_num_workers,
+            report_to="none",
+        )
+
+        trainer_kwargs = dict(
+            model=self.model,
+            args=args,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            callbacks=callbacks,
+        )
+        if loss is not None:
+            trainer_kwargs["loss"] = loss
+
+        trainer = CrossEncoderTrainer(**trainer_kwargs)
+        trainer.train()
+        logger.info("Reranker обучение завершено.")
+
+        if has_eval:
+            self.save_model(best_model_dir)
+            logger.info("Лучший реранкер сохранён → %s", best_model_dir)
+
+    def _train_legacy(
+        self,
+        train_df: pd.DataFrame,
+        eval_df: Optional[pd.DataFrame],
+        warmup_steps: int,
+        best_model_dir: str,
+    ) -> None:
+        """Fallback: CrossEncoder.fit() (ST < 3.0 или ошибка импорта)."""
+        from sentence_transformers import InputExample
+        from torch.utils.data import DataLoader
+
+        def _to_examples(df: pd.DataFrame) -> List:
+            examples = []
+            for _, row in df.iterrows():
+                examples.append(InputExample(texts=[row["anchor"], row["positive"]], label=1.0))
+                examples.append(InputExample(texts=[row["anchor"], row["negative"]], label=0.0))
+            return examples
+
+        train_dl = DataLoader(
+            _to_examples(train_df),
+            shuffle=True,
+            batch_size=self.config.batch_size,
+        )
+
+        evaluator = None
+        if eval_df is not None:
+            try:
+                from sentence_transformers.cross_encoder.evaluation import (
+                    CEBinaryClassificationEvaluator,
+                )
+                evaluator = CEBinaryClassificationEvaluator.from_input_examples(
+                    _to_examples(eval_df)
+                )
+            except Exception:
+                pass
+
+        Path(best_model_dir).mkdir(parents=True, exist_ok=True)
+        self.model.fit(
+            train_dataloader=train_dl,
+            evaluator=evaluator,
+            epochs=self.config.num_epochs,
+            warmup_steps=warmup_steps,
+            optimizer_params={"lr": self.config.learning_rate},
+            output_path=best_model_dir,
+            save_best_model=True,
+        )
+        logger.info("Reranker (legacy) обучение завершено → %s", best_model_dir)
+
+    # ── Save / Load ──────────────────────────────────────────────────────────
+
+    def save_model(self, path: str) -> None:
+        Path(path).mkdir(parents=True, exist_ok=True)
+        self.model.save(path)
+        logger.info("Реранкер сохранён: %s", path)
+
+    def load_model(self, path: str) -> None:
+        from sentence_transformers import CrossEncoder
+        self.model = CrossEncoder(
+            path, max_length=self.config.max_seq_length, device=self.device
+        )
+        logger.info("Реранкер загружен из: %s", path)
+
+    def get_model(self):
+        return self.model
+
+
+def make_reranker_cpu_config(
+    num_epochs: int = 3,
+    output_dir: str = "./output_cpu",
+) -> RerankerConfig:
+    """Конфигурация реранкера для CPU."""
+    return RerankerConfig(
+        num_epochs=num_epochs,
+        batch_size=4,
+        learning_rate=2e-5,
+        warmup_ratio=0.1,
+        gradient_accumulation_steps=8,
+        fp16=False,
+        bf16=False,
+        output_dir=output_dir,
+    )
+
+
+def make_reranker_gpu_config(
+    num_epochs: int = 3,
+    output_dir: str = "./output_gpu",
+) -> RerankerConfig:
+    """Конфигурация реранкера для GPU (A100/V100/T4)."""
+    return RerankerConfig(
+        num_epochs=num_epochs,
+        batch_size=16,
+        learning_rate=2e-5,
+        warmup_ratio=0.1,
+        gradient_accumulation_steps=1,
+        fp16=False,
+        bf16=False,
+        output_dir=output_dir,
+        dataloader_num_workers=4,
+    )
